@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation Sample Template WordPress: WordPress is web software you
+  can use to create a beautiful website or blog. This template installs
+  WordPress with a remote MariaDB database for storage. It demonstrates using
+  the AWS CloudFormation bootstrap scripts to deploy WordPress. **WARNING** This
+  template creates an Amazon EC2 instance. You will be billed for the AWS
+  resources used if you create a stack from this template.
+
+#parameters
+Parameters:
+  DomainName:
+    Description: >-
+      The fully qualified name for the source VPC, such as onpremsim.env. The
+      name doesn't need to be publicly resolvable; it will resolve inside your
+      VPC only.
+    Type: String
+    MinLength: '5'
+    MaxLength: '16'
+    Default: onpremsim.env
+  WEBInstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  OnPremSimVPC:
+    Description: VPC to place Wordpress.
+    Type: 'AWS::EC2::VPC::Id'
+  OnPremSimSubnet1:
+    Description: Private Subnet to place Wordpress.
+    Type: 'AWS::EC2::Subnet::Id'
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  DBName:
+    Default: wordpressdb
+    Description: The WordPress database name
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBUser:
+    Default: wordpress
+    Description: The WordPress database admin account username
+    Type: String
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBPassword:
+    NoEcho: 'true'
+    Description: The WordPress database admin account password
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+  RootPassword:
+    NoEcho: 'true'
+    Description: >-
+      super user password. user is member of root group and can runas commands
+      as root
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+
+
+#mappings
+Mappings:
+  RegionMap:
+    us-east-1:
+      CentOS7x8664EBSHVM: ami-088f16c57ce74d90e
+    us-west-2:
+      CentOS7x8664EBSHVM: ami-040f9e8ab2841a9b3
+
+
+#resources
+Resources:
+#create security groups
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref OnPremSimVPC
+      GroupDescription: Enable HTTP access via port 80 locked down to the load balancer + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref OnPremSimVPC
+      GroupDescription: Enable mariadb access via port 3306 locked down to the load balancer + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+
+  #create db server first
+  DBServer:
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          wordpress_install:
+            - install_cfn
+            - register_dns
+            - setup_ssh
+            - install_wordpress
+            - configure_wordpress
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub | 
+                  [main]
+                  stack= ${AWS::StackId}
+                  region= ${AWS::Region}
+                  verbose=true
+                  interval=5
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.DBServer.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName}  --resource DBServer --configsets wordpress_install --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        register_dns:
+          files:
+            /tmp/nsupdate.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    ADDR=`hostname -I`
+                    HOST=`hostname`
+                    REVERSE=`echo $ADDR | awk -F. '{ print $4, $3, $2, $1 }' OFS='.'`
+                    echo "server dns.${DomainName}" > /tmp/nsupdate.txt
+                    echo "update delete $HOST A" >> /tmp/nsupdate.txt
+                    echo "update add $HOST 86400 A $ADDR" >> /tmp/nsupdate.txt
+                    echo "" >> /tmp/nsupdate.txt
+                    echo "update add $REVERSE.in-addr.arpa. 86400 PTR $HOST." >> /tmp/nsupdate.txt
+                    echo "send" >> /tmp/nsupdate.txt
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            register_dns:
+              command: /tmp/nsupdate.sh ; nsupdate /tmp/nsupdate.txt
+        setup_ssh:
+          files:
+            /tmp/adduser.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    adduser user -g wheel
+                    echo ${RootPassword} | passwd user --stdin
+              mode: '000500'
+              owner: root
+              group: root
+            /tmp/fixssh.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+                    systemctl restart sshd
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_create_user:
+              command: /tmp/adduser.sh
+            02_fix_ssh:
+              command: /tmp/fixssh.sh
+            03_fix_sudo:
+              command: "echo '%wheel        ALL=(ALL)       NOPASSWD: ALL'  >>/etc/sudoers"
+        install_wordpress:
+          packages:
+            yum:
+              mariadb: []
+              mariadb-server: []
+              mariadb-devel: []
+              mariadb-libs: []
+          files:
+            /tmp/setup.mariadb:
+              content: !Sub |
+                  CREATE DATABASE ${DBName};
+                  CREATE USER ${DBUser}@'%' IDENTIFIED BY '${DBPassword}';
+                  GRANT ALL ON ${DBName}.* TO ${DBUser}@'%';
+                  FLUSH PRIVILEGES;
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              mariadb:
+                enabled: 'true'
+                ensureRunning: 'true'
+        configure_wordpress:
+          commands:
+            01_set_mariadb_root_password:
+              command: !Sub |
+                  mysqladmin -u root password '${RootPassword}'
+              test: !Sub | 
+                 $(mysql ${DBName} -u root --password='${RootPassword}' >/dev/null 2>&1 </dev/null); (( $? != 0 ))
+            02_create_database:
+              command: !Sub | 
+                mysql -u root --password='${RootPassword}' < /tmp/setup.mariadb
+              test: !Sub | 
+                $(mysql ${DBName} -u root --password='${RootPassword}' >/dev/null 2>&1 </dev/null); (( $? != 0 ))
+    Properties:
+      ImageId: !FindInMap 
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - CentOS7x8664EBSHVM
+      InstanceType: !Ref WEBInstanceType
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-Wordpress-DB
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref OnPremSimSubnet1
+          GroupSet:
+            - !Ref DatabaseSecurityGroup
+      UserData: 
+       Fn::Base64: 
+        !Sub |
+              #!/bin/bash -xe
+              hostnamectl set-hostname wordpress-db.${DomainName}
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DBServer --configsets wordpress_install --region ${AWS::Region}
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName}  --resource DBServer --region ${AWS::Region}
+              sleep 30
+              yum remove cloud-init -y
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+  
+  #create webserver
+  WebServer:
+    DependsOn: DBServer
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          wordpress_install:
+            - install_cfn
+            - register_dns
+            - setup_ssh
+            - install_wordpress
+            - configure_wordpress
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub | 
+                    [main]
+                    stack=${AWS::StackId}
+                    region=${AWS::Region}
+                    verbose=true
+                    interval=5
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                    [cfn-auto-reloader-hook]
+                    triggers=post.update
+                    path=Resources.WebServer.Metadata.AWS::CloudFormation::Init
+                    action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --configsets wordpress_install --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        register_dns:
+          files:
+            /tmp/nsupdate.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    ADDR=`hostname -I`
+                    HOST=`hostname`
+                    REVERSE=`echo $ADDR | awk -F. '{ print $4, $3, $2, $1 }' OFS='.'`
+                    echo "server dns.${DomainName}" > /tmp/nsupdate.txt
+                    echo "update delete $HOST A" >> /tmp/nsupdate.txt
+                    echo "update add $HOST 86400 A $ADDR" >> /tmp/nsupdate.txt
+                    echo "" >> /tmp/nsupdate.txt
+                    echo "update add $REVERSE.in-addr.arpa. 86400 PTR $HOST." >> /tmp/nsupdate.txt
+                    echo "send" >> /tmp/nsupdate.txt
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            register_dns:
+              command: /tmp/nsupdate.sh ; nsupdate /tmp/nsupdate.txt
+        setup_ssh:
+          files:
+            /tmp/adduser.sh:
+              content: !Sub | 
+                    #!/bin/sh
+                    adduser user -g wheel
+                    echo ${RootPassword} | passwd user --stdin
+              mode: '000500'
+              owner: root
+              group: root
+            /tmp/fixssh.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+                    systemctl restart sshd
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_create_user:
+              command: /tmp/adduser.sh
+            02_fix_ssh:
+              command: /tmp/fixssh.sh
+            03_fix_sudo:
+              command: "echo '%wheel        ALL=(ALL)       NOPASSWD: ALL'  >>/etc/sudoers"
+        install_wordpress:
+          packages:
+            yum:
+              php: []
+              php-mysql: []
+              mariadb: []
+              mariadb-devel: []
+              mariadb-libs: []
+              httpd: []
+              wp-cli: []
+          sources:
+            /var/www/html: 'http://wordpress.org/latest.tar.gz'
+          files:
+            /tmp/create-wp-config:
+              content: !Sub | 
+                    #!/bin/bash -xe
+                    mv /var/www/html/wordpress/* /var/www/html/
+                    cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+                    sed -i "s/'localhost'/'wordpress-db.${DomainName}'/g" wp-config.php
+                    sed -i "s/'database_name_here'/'${DBName}'/g" wp-config.php
+                    sed -i "s/'username_here'/'${DBUser}'/g" wp-config.php
+                    sed -i "s/'password_here'/'${DBPassword}'/g" wp-config.php
+              mode: '000500'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+        configure_wordpress:
+          commands:
+            01_configure_wordpress:
+              command: /tmp/create-wp-config
+              cwd: /var/www/html
+            04_setup_wordpress:
+              command: !Sub |  
+                    /usr/bin/curl -v --data-urlencode 'weblog_title=My Intranet Site' --data-urlencode 'user_name=admin' --data-urlencode 'admin_password=${RootPassword}' --data-urlencode 'admin_password2=${RootPassword}' --data-urlencode 'admin_email=admin@admin.com' --data-urlencode 'Submit=Install+WordPress' http://wordpress-web.${DomainName}/wp-admin/install.php?step=2 
+                    sleep 10
+                    cd /var/www/html
+                    wp post create --post_title='Migration Immersion Day' --post_content='We are migrating our internal servers to AWS!' --post_status=publish 
+                    wp theme install blog64 --activate    
+    Properties:
+      ImageId: !FindInMap 
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - CentOS7x8664EBSHVM
+      InstanceType: !Ref WEBInstanceType
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-Wordpress-WEB
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref OnPremSimSubnet1
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+      UserData: 
+        Fn::Base64: 
+           !Sub |
+              #!/bin/bash -xe
+              hostnamectl set-hostname wordpress-web.${DomainName}
+              while ! yum install -y http://rpms.remirepo.net/enterprise/remi-release-7.rpm ; do sleep 1; done
+              while ! yum-config-manager --enable remi-php56  ; do sleep 1; done
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --configsets wordpress_install --region ${AWS::Region}
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+              sleep 30
+              yum remove cloud-init -y
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+Outputs:
+  WebsiteURL:
+    Value: !Sub http://wordpress-web.${DomainName}/
+    Description: WordPress Website

@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function to provide tracking to Migration Immersion Day.
+Parameters:
+  Source:
+    Type: String
+    Default: EventEngine
+    AllowedValues:
+      - EventEngine
+      - SelfService
+      - EventEngineCEMF
+  
+Resources:
+  MIDTrackerClient:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+            AWSREGION : !Ref "AWS::Region"
+            SOURCE : !Ref Source
+            APIEndpoint : https://ldk43yz1j0.execute-api.us-west-2.amazonaws.com/default/MigrationImmersionDayTracker
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          import cfnresponse
+
+          def lambda_handler(event, context):
+            print('Received request:\n%s' % json.dumps(event, indent=4))
+
+            if event['RequestType'] in ['Create', 'Update']:
+              try:
+                account=event['ServiceToken'].split(':')[4]
+
+                data = {'region': os.environ['AWSREGION'], 
+                        'SOURCE': os.environ['SOURCE'],
+                        'account': account
+                       }
+
+                encoded_data = json.dumps(data).encode('utf-8')
+                http = urllib3.PoolManager()
+                resp = http.request('POST', os.environ['APIEndpoint'], body=encoded_data, headers={'Content-Type': 'application/json'} )
+              except:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                raise
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            elif event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+
+      Description: Migration Immersion Day tracker.
+
+      
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:*
+            Resource: arn:aws:logs:*:*:*
+
+  MIDTrackerCustomResource: 
+    Type: "Custom::MIDTracker"
+    Properties: 
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${MIDTrackerClient}

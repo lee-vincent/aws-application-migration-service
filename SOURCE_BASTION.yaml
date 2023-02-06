@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Bastion/Execution Server host template for the AWS Migration Immersion Day. Also, you are
+  solely responsible for complying with the license terms for the software
+  downloaded and installed by this template. By creating a stack from this
+  template, you are agreeing to such terms.
+Parameters:
+  AdminPassword:
+    Description: 'The password for the default administrative user, Administrator '
+    NoEcho: 'true'
+    Type: String
+    MinLength: '8'
+    MaxLength: '18'
+    ConstraintDescription: Please use a complex password.
+  bastionSize:
+    Description: ec2 instance size for the bastion host
+    Type: String
+    AllowedValues:
+      - t3.medium
+      - t3.small
+      - t3.large
+    Default: t3.medium
+  VPCSource:
+    Description: VPC to place Bastion Host. Preferred is Source Environment
+    Type: 'AWS::EC2::VPC::Id'
+  SubnetSourcePublic:
+    Description: Public Subnet to place Bastion Host. Preferred is Source Environment
+    Type: 'AWS::EC2::Subnet::Id'
+  SourceCidrForRDP:
+    Description: >-
+      IP Cidr from which you are likely to RDP into the instances. You can add
+      rules later by modifying the created security groups e.g. 54.32.98.160/32
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]+\.){3}[0-9]+\/[0-9]+$'
+  WindowsLastestAmiID:
+    Description: The latest AMI ID for Windows 2019 from Amazon
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+  InstanceProfile:
+    Description: The instance profile for migration execution server
+    Type: String
+    Default: 'migration-factory-lab-MGN-ExeServer-profile'
+
+Resources:
+  BastionEIP:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      InstanceId: !Ref MIDBastion
+  BastionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable RDP
+      VpcId: !Ref VPCSource
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref SourceCidrForRDP
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+  MGNExeServerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'MGN-ExeServerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  MGNExeServerPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: 'MGN-ExeServerPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - 'iam:PassRole'
+              - 'sts:AssumeRole'
+            Resource: 'arn:aws:iam::*:role/Factory*'
+          -
+            Effect: Allow
+            Action:
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:ListSecrets'
+            Resource: !Sub 'arn:aws:secretsmanager:*:${AWS::AccountId}:secret:*'
+      Roles:
+        - !Ref MGNExeServerRole
+
+  MGNExeServerInsProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: 'MGN-ExeServer-profile'
+      Roles:
+        - !Ref MGNExeServerRole
+        
+  MIDBastion:
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          bastion_install:
+            - install_cfn
+            - install_apps
+        install_cfn:
+          files:
+            'c:\cfn\cfn-hup.conf':
+              content: !Join
+                - ''
+                - - |
+                    [main]
+                  - stack=
+                  - !Ref 'AWS::StackId'
+                  - |+
+
+                  - region=
+                  - !Ref 'AWS::Region'
+                  - |+
+
+            'c:\cfn\hooks.d\cfn-auto-reloader.conf':
+              content: !Join
+                - ''
+                - - |
+                    [cfn-auto-reloader-hook]
+                  - |
+                    triggers=post.update
+                  - |
+                    path=Resources.MIDBastion.Metadata.AWS::CloudFormation::Init
+                  - 'action=cfn-init.exe -v -s '
+                  - !Ref 'AWS::StackId'
+                  - ' -r MIDBastion'
+                  - ' --configsets bastion_install'
+                  - ' --region '
+                  - !Ref 'AWS::Region'
+                  - |+
+
+          services:
+            windows:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - 'c:\cfn\cfn-hup.conf'
+                  - 'c:\cfn\hooks.d\cfn-auto-reloader.conf'
+        install_apps:
+          files:
+            'c:\cfn\scripts\retry-command.ps1':
+              content: !Join
+                - ''
+                - - >-
+                    function Retry-Command {
+                      [CmdletBinding()]
+                      Param(
+                          [Parameter(Position=0, Mandatory=$true)]
+                          [scriptblock]$ScriptBlock,
+                          [Parameter(Position=1, Mandatory=$false)]
+                          [int]$Maximum = 5,
+                          [Parameter(Position=2, Mandatory=$false)]
+                          [int]$Delay = 100
+                      )
+                      Begin {
+                          $cnt = 0
+                      }
+                      Process {
+                          do {
+                              $cnt++
+                              try {
+                                  $ScriptBlock.Invoke()
+                                  return
+                              } catch {
+                                  Write-Error $_.Exception.InnerException.Message -ErrorAction Continue
+                                  Start-Sleep -Milliseconds $Delay
+                              }
+                          } while ($cnt -lt $Maximum)
+
+                          # Throw an error after $Maximum unsuccessful invocations. Doesn't need
+                          # a condition, since the function returns upon successful invocation.
+                          throw 'Execution failed.'
+                      }
+                    }
+            
+            'c:\cfn\scripts\downloadCEMF.ps1': 
+              content: !Join
+                - ''
+                - - >-
+                    Import-module c:\cfn\scripts\retry-command.ps1 -Force
+                    
+                    Retry-Command -ScriptBlock {
+                      $Path = $env:TEMP; $Installer = "Migrations.zip";
+                      Invoke-WebRequest "https://ee-assets-prod-us-east-1.s3.amazonaws.com/modules/migration-baseinfra/v6/Bastion/Migrations.zip" -OutFile $Path\$Installer;
+                      Expand-Archive -Path $Path\$Installer -DestinationPath c:\Migrations
+                      Remove-Item $Path\$Installer
+                    }
+
+            'c:\cfn\scripts\installchrome.ps1':
+              content: !Join
+                - ''
+                - - >-
+                    Import-module c:\cfn\scripts\retry-command.ps1 -Force
+
+                    Retry-Command -ScriptBlock {
+                      $Path = $env:TEMP; $Installer = "chrome_installer.exe";
+                      Invoke-WebRequest "http://dl.google.com/chrome/install/375.126/chrome_installer.exe" -OutFile $Path\$Installer;
+                      Start-Process -FilePath $Path\$Installer -Args "/silent /install" -Verb RunAs -Wait;
+                      Remove-Item $Path\$Installer
+                    }
+
+            'c:\cfn\scripts\installnpp.ps1':
+              content: !Join
+                - ''
+                - - >-
+                    Import-module c:\cfn\scripts\retry-command.ps1 -Force
+
+                    Retry-Command -ScriptBlock {
+                      $Path = $env:TEMP; $Installer = "npp_installer.exe";
+                      Invoke-WebRequest "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v7.9.5/npp.7.9.5.Installer.exe" -OutFile $Path\$Installer; 
+                      Start-Process -FilePath $Path\$Installer -Args "/S" -Verb RunAs -Wait;
+                      Remove-Item $Path\$Installer
+                    }
+            'c:\putty.reg':
+              source: "https://ee-assets-prod-us-east-1.s3.amazonaws.com/modules/migration-baseinfra/v6/Bastion/putty.reg"
+
+            'c:\cfn\scripts\installputty.ps1':
+              content: !Join
+                - ''
+                - - >
+                    Import-module c:\cfn\scripts\retry-command.ps1 -Force
+
+                    Retry-Command -ScriptBlock {
+                      Invoke-WebRequest "https://the.earth.li/~sgtatham/putty/0.74/w64/putty-64bit-0.74-installer.msi" -OutFile c:\putty.msi; 
+                      Start-Process msiexec.exe -ArgumentList '/i c:\putty.msi /q' -Verb RunAs -Wait;
+                      Remove-Item c:\putty.msi;
+                      New-Item -ItemType SymbolicLink -Path 'C:\Users\Administrator\Desktop\' -name 'Putty' -Value 'C:\Program Files\PuTTY\putty.exe';
+                      reg import c:\putty.reg;
+                    }
+                    
+            'c:\cfn\scripts\installpython.ps1':
+              content: !Join
+                - ''
+                - - >
+                    Import-module c:\cfn\scripts\retry-command.ps1 -Force
+                    
+                    Retry-Command -ScriptBlock {                
+                      Invoke-WebRequest "https://www.python.org/ftp/python/3.9.2/python-3.9.2.exe" -OutFile c:\python.exe; 
+                      Start-Process c:\python.exe -ArgumentList '/quiet' -Verb RunAs -Wait; 
+                      Remove-Item c:\python.exe;
+                      [Environment]::SetEnvironmentVariable;("C:\Users\Administrator\AppData\Local\Programs\Python\Python37-32\",$env:Path, [System.EnvironmentVariableTarget]::Machine)
+                      [Environment]::SetEnvironmentVariable;("C:\Users\Administrator\AppData\Local\Programs\Python\Python37-32\Scripts\",$env:Path, [System.EnvironmentVariableTarget]::Machine)
+                      py.exe -m pip install --upgrade pip;
+                      py.exe -m pip install requests;
+                      py.exe -m pip install paramiko;
+                      py.exe -m pip install boto3;
+                    }
+          commands:
+            0-downloadCEMF:
+              command: 'powershell.exe c:\cfn\scripts\downloadCEMF.ps1'
+              waitAfterCompletion: '5'
+            1-installchrome:
+              command: 'powershell.exe c:\cfn\scripts\installchrome.ps1'
+              waitAfterCompletion: '5'
+            2-installputty:
+              command: 'powershell.exe c:\cfn\scripts\installputty.ps1'
+              waitAfterCompletion: '5'
+            3-installpython:
+              command: 'powershell.exe c:\cfn\scripts\installpython.ps1'
+              waitAfterCompletion: '5'
+            4-installNotepadpp:
+              command: 'powershell.exe c:\cfn\scripts\installnpp.ps1'
+              waitAfterCompletion: '5'
+            5-desktopMSTSC:
+              command: >-
+                powershell.exe New-Item -ItemType SymbolicLink -Path
+                'C:\Users\Administrator\Desktop\' -name 'Microsoft Remote
+                Desktop Client' -Value 'C:\windows\system32\mstsc.exe'
+              waitAfterCompletion: '5'
+            6-desktopArchitecture:
+              command: >-
+                powershell.exe Invoke-WebRequest
+                "https://awsmigrationfactory.s3.amazonaws.com/workshop/mgn/architecture3.png"
+                -OutFile C:\Users\Administrator\Desktop\Architecture.png
+              waitAfterCompletion: '5'
+    Properties:
+      InstanceType: !Ref bastionSize
+      IamInstanceProfile: !Ref MGNExeServerInsProfile
+      ImageId: !Ref WindowsLastestAmiID
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref BastionSecurityGroup
+          AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+          SubnetId: !Ref SubnetSourcePublic
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-Bastion
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              <powershell>
+                net user Administrator "${AdminPass}"
+                cfn-init.exe -v -s ${AWS::StackId} -r MIDBastion --region ${AWS::Region} --configsets bastion_install
+                
+                cfn-signal.exe -e %ERRORLEVEL% --stack ${AWS::StackId} --resource MIDBastion --region ${AWS::Region}
+              </powershell>
+            - AdminPass: !Ref AdminPassword
+Outputs:
+  BastionRDP:
+    Value: !Ref BastionEIP
+    Description: >-
+      Bastion Host RDP connection. Please retrieve Administrator password of the
+      instance to be able to RDP

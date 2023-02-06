@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+    AWS CloudFormation Sample Template deploying a standard Windows instance **WARNING** This template creates an Amazon
+    EC2 instance. You will be billed for the AWS resources used if you create a
+    stack from this template.
+Parameters:
+  AdminPassword:
+    Description: 'The password for the default administrative user, Administrator '
+    NoEcho: 'true'
+    Type: String
+    MinLength: '8'
+    MaxLength: '18'
+    ConstraintDescription: must contain alphanumeric+special characters.
+  opWindowsSize:
+    Description: ec2 instance size for the Source Windows host
+    Type: String
+    AllowedValues:
+      - t3.medium
+      - t3.small
+      - t3.large
+    Default: t3.small
+  SourceCidrForRDP:
+    Description: >-
+      IP Cidr from which you are likely to RDP into the instances. You can add
+      rules later by modifying the created security groups e.g. 54.32.98.160/32
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]+\.){3}[0-9]+\/[0-9]+$'
+  WindowsLastestAmiID:
+    Description: The latest AMI ID for Windows 2019 from Amazon
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+
+Resources:
+  opWindowsSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable RDP
+      VpcId: !ImportValue 'MID-VPCSource'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5985
+          ToPort: 5985
+          CidrIp: !Ref SourceCidrForRDP
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref SourceCidrForRDP
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 192.168.0.0/16
+
+  OnPremWindows:
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            c:\cfn\cfn-hup.conf:
+              content:
+                Fn::Join:
+                - ''
+                - - "[main]\n"
+                  - stack=
+                  - Ref: AWS::StackId
+                  - "\n"
+                  - region=
+                  - Ref: AWS::Region
+                  - "\n"
+            c:\cfn\hooks.d\cfn-auto-reloader.conf:
+              content:
+                Fn::Join:
+                - ''
+                - - "[cfn-auto-reloader-hook]\n"
+                  - 'triggers=post.update
+
+                    '
+                  - 'path=Resources.OnPremWindows.Metadata.AWS::CloudFormation::Init
+
+                    '
+                  - 'action=cfn-init.exe -v -s '
+                  - Ref: AWS::StackId
+                  - " -r OnPremWindows"
+                  - " --region "
+                  - Ref: AWS::Region
+                  - "\n"
+          commands:
+            1-install-roles:
+              command: >-
+                powershell.exe Install-WindowsFeature -Name
+                'Web-Server' -IncludeAllSubFeature -restart
+              waitAfterCompletion: '10'
+            2-signal-success:
+              command:
+                Fn::Join:
+                - ''
+                - - cfn-signal.exe -e %ERRORLEVEL% "
+                  - Fn::Base64:
+                      Ref: WindowsServerWaitHandle
+                  - "\""
+          services:
+            windows:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - c:\cfn\cfn-hup.conf
+                - c:\cfn\hooks.d\cfn-auto-reloader.conf
+    Properties:
+      InstanceType: !Ref opWindowsSize
+      ImageId: !Ref WindowsLastestAmiID
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref opWindowsSecurityGroup
+          AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+          SubnetId: !ImportValue 'MID-SubnetSourcePrivate'
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-OnPremWindows
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              <powershell>
+                net user Administrator "${AdminPass}"
+                $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled = 'True'"
+                $adapters.SetDynamicDNSRegistration($true,$true)
+                Set-NetFirewallRule -DisplayName "Windows Remote Management (HTTP-In)" -RemoteAddress "192.168.0.0/16"
+                cfn-init.exe -v -s ${AWS::StackId} -r OnPremWindows --region ${AWS::Region}
+                Rename-Computer -NewName "windows" -Restart
+                Register-DnsClient
+              </powershell>
+            - AdminPass: !Ref AdminPassword
+  WindowsServerWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  WindowsServerWaitCondition:
+      Type: AWS::CloudFormation::WaitCondition
+      DependsOn: OnPremWindows
+      Properties:
+        Handle:
+          Ref: WindowsServerWaitHandle
+        Timeout: '1800'

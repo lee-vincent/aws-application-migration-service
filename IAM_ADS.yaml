@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  IAM template for the AWS Migration Immersion Day. ADS Module. Also, you are solely
+  responsible for complying with the license terms for the software downloaded
+  and installed by this template. By creating a stack from this template, you
+  are agreeing to such terms.
+Resources:
+  ADSGroup:
+    Type: AWS::IAM::Group
+    Properties: 
+      GroupName: adsgroup
+      ManagedPolicyArns: 
+        - 'arn:aws:iam::aws:policy/AWSApplicationDiscoveryAgentAccess'
+
+  ADSUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: adsuser
+      Groups: ["adsgroup"]
+
+  ADSaccesskey:
+    Type: 'AWS::IAM::AccessKey'
+    Properties:
+      UserName: !Ref ADSUser
+
+  migrationhubdiscovery:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - migrationhub.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSMigrationHubDiscoveryAccess'
+      RoleName: migrationhub-discovery
+
+  AWSApplicationDiscoveryServiceFirehose:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSDiscoveryContinuousExportFirehosePolicy'
+      RoleName: AWSApplicationDiscoveryServiceFirehose

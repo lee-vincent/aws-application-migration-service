@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  M.I.D template to create the Migration Immersion Day workshop. Also, you are
+  solely responsible for complying with the license terms for the software
+  downloaded and installed by this template. By creating a stack from this
+  template, you are agreeing to such terms.
+
+#Parameters
+Parameters:
+  DomainName:
+    Description: >-
+      The fully qualified name for the source VPC, such as onpremsim.env. The
+      name doesn't need to be publicly resolvable; it will resolve inside your
+      VPC only.
+    Type: String
+    MinLength: '5'
+    MaxLength: '16'
+    Default: onpremsim.env
+  AdminPassword:
+    Description: >-
+      The password for the Bastion Administrator. must contain exactly 8
+      characters. please use alphanumeric+special characters. at least one
+      number, one upper case, one lower case and one special (#@$)
+    NoEcho: 'true'
+    Type: String
+    MinLength: '8'
+    MaxLength: '8'
+    ConstraintDescription: >-
+      must contain exactly 8 characters. please use alphanumeric+special
+      characters. at least one number, one upper case, one lower case and one
+      special (#@$)
+  RootPassword:
+    NoEcho: 'true'
+    Description: >-
+      SSH password for user 'user'. This user has sudo power. must contain
+      exactly 8 characters. please use only alphanumeric characters.
+    Type: String
+    MinLength: '8'
+    MaxLength: '8'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: >-
+      must contain exactly 8 characters. please use only alphanumeric
+      characters.
+  SourceS3Bucket:
+    Description: S3 Bucket with CFN stack files
+    Type: String
+    Default: ee-assets-prod-us-east-1
+  SourceS3Path:
+    Description: S3 Path with CFN stack files
+    Type: String
+    Default: modules/migration-baseinfra/v6
+  EC2ModelWindows:
+    Description: Model of EC2 Servers in the source environment - Windows
+    Type: String
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.small
+  EC2ModelLinux:
+    Description: Model of EC2 Servers in the source environment - Linux
+    Type: String
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.small
+  EC2ModelBastion:
+    Description: Model of EC2 Servers in the source environment - Windows Bastion
+    Type: String
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.medium
+  SourceCidrForRDP:
+    Description: >-
+      IP Cidr from which you are likely to RDP into the instances. You can add
+      rules later by modifying the created security groups e.g. 54.32.98.160/32
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]+\.){3}[0-9]+\/[0-9]+$'
+  LaunchBastion:
+    Description: Launch Bastion Server
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchWordpress:
+    Description: Launch Wordpress App
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchOFBiz:
+    Description: Launch OFBiz App
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchWindows:
+    Description: Launch Windows SVR
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchMF:
+    Description: Launch Migration Factory
+    Default: 'MGN'
+    Type: String
+    AllowedValues:
+      - 'MGN'
+      - 'CE'
+      - 'FALSE'
+  Track:
+    Description: >-
+      Track statistics about this workshop. The information collected are:
+      account number, region and timestamp of when this cloudformation was
+      executed
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  CreateIAM:
+    Description: Create IAM and CE credentials
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+
+#Metadata
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Source Server - Configuration
+        Parameters:
+          - AdminPassword
+          - RootPassword
+          - EC2ModelBastion
+          - EC2ModelLinux
+          - EC2ModelWindows
+      - Label:
+          default: Deploy nested stacks
+        Parameters:
+          - LaunchMF
+          - CreateIAM
+          - LaunchOFBiz
+          - LaunchWordpress
+          - LaunchWindows
+          - LaunchBastion
+      - Label:
+          default: Networking
+        Parameters:
+          - DomainName
+          - SourceCidrForRDP
+      - Label:
+          default: CloudFormation Stack
+        Parameters:
+          - SourceS3Bucket
+          - SourceS3Path
+          - Track
+
+#Conditions
+Conditions:
+  CreateBastion: !Equals 
+    - !Ref LaunchBastion
+    - 'TRUE'
+  CreateWordpress: !Equals 
+    - !Ref LaunchWordpress
+    - 'TRUE'
+  CreateOFBiz: !Equals 
+    - !Ref LaunchOFBiz
+    - 'TRUE'
+  CreateWindows: !Equals
+    - !Ref LaunchMF
+    - 'MGN'
+  DeployMF: !Equals 
+    - !Ref LaunchMF
+    - 'CE'
+  DeployMFMGN: !Equals 
+    - !Ref LaunchMF
+    - 'MGN'
+  DeployTargetAcct: !Equals
+    - !Ref LaunchMF
+    - 'MGN'
+  DeployIAM: !Equals 
+    - !Ref CreateIAM
+    - 'TRUE'
+  MIDTrack: !Equals 
+    - !Ref Track
+    - 'TRUE'
+
+#Resources
+Resources:
+  SOURCENETWORK:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/SOURCE_NETWORK.yaml
+      Parameters:
+        DomainName: !Ref DomainName
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+
+
+  CENETWORK:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/ee-assets-prod-us-east-1/modules/migration-cloudendure/v2/cfn/CE_NETWORK.json
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: CENETWORK
+
+  CEIAM:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: DeployIAM
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/IAM_CE.yaml
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: CEIAM
+
+  ADSIAM:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: DeployIAM
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/IAM_ADS.yaml
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: ADSIAM
+
+  SOURCEBASTION:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateBastion
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/SOURCE_BASTION.yaml
+      Parameters:
+        AdminPassword: !Ref AdminPassword
+        bastionSize: !Ref EC2ModelBastion
+        VPCSource: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        SubnetSourcePublic: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePublic
+        SourceCidrForRDP: !Ref SourceCidrForRDP
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+
+  SOURCEWORDPRESS:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateWordpress
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/SOURCE_WORDPRESS.yaml
+      Parameters:
+        DomainName: !Ref DomainName
+        OnPremSimVPC: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        OnPremSimSubnet1: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePrivate
+        WEBInstanceType: !Ref EC2ModelLinux
+        DBPassword: !Ref RootPassword
+        RootPassword: !Ref RootPassword
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+
+  SOURCEOFBIZ:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateOFBiz
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/SOURCE_OFBiz.yaml
+      Parameters:
+        DomainName: !Ref DomainName
+        OnPremSimVPC: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        OnPremSimSubnet1: !GetAtt 
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePrivate
+        WEBInstanceType: !Ref EC2ModelLinux
+        DBPassword: !Ref RootPassword
+        RootPassword: !Ref RootPassword
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+  SOURCEWINDOWS:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateWindows
+    DependsOn: SOURCENETWORK
+    Properties:
+      TemplateURL: https://awsmigrationfactory-us-west-2.s3.amazonaws.com/workshop/mgn/SOURCE_WINDOWS.yml
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        opWindowsSize: !Ref EC2ModelWindows
+        AdminPassword: !Ref RootPassword
+  FACTORY:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: DeployMF
+    Properties:
+      TemplateURL: https://awsmigrationfactory-us-west-2.s3.amazonaws.com/template/migration-factory-p-multi-region.yaml
+  FACTORYMGN:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: DeployMFMGN
+    Properties:
+      TemplateURL: https://awsmigrationfactory-us-west-2.s3.amazonaws.com/workshop/mgn/aws-cloudendure-migration-factory-solution_lab.template
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: FACTORYMGN
+
+  TARGETACCT:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: DeployTargetAcct
+    Properties:
+      TemplateURL: https://awsmigrationfactory-us-west-2.s3.amazonaws.com/workshop/mgn/TARGET_ACCOUNT_Config.yml
+      Tags:
+        - Key: Env
+          Value: MID-MGN-Config
+        - Key: Stack
+          Value: TargetAccountConfig
+      Parameters:
+        FactoryAWSAccountId: !Ref AWS::AccountId  
+  Tracker:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: MIDTrack
+    Properties:
+      TemplateURL: !Sub https://${SourceS3Bucket}.s3.amazonaws.com/${SourceS3Path}/TRACKER.yaml
+      Parameters:
+        Source: SelfService
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: MIDTrack
+
+#Outputs
+Outputs:
+  AWSAccountId:
+    Value: !Ref AWS::AccountId
+  BastionRDP:
+    Value: !GetAtt 
+      - SOURCEBASTION
+      - Outputs.BastionRDP
+    Condition: CreateBastion
+
+  SubnetTargetPublic:
+    Value: !GetAtt 
+      - SOURCENETWORK
+      - Outputs.SubnetTargetPublic
+
+  SubnetTargetPrivate:
+    Value: !GetAtt 
+      - SOURCENETWORK
+      - Outputs.SubnetTargetPrivate
+
+  TargetSecurityGroup:
+    Value: !GetAtt 
+      - SOURCENETWORK
+      - Outputs.TargetSecurityGroup
+  TargetSecurityGroupTest:
+    Value: !GetAtt
+      - SOURCENETWORK
+      - Outputs.TargetSecurityGroupTest
+  LoginAPI:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.LoginAPI
+  UserAPI:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.UserAPI
+  UserPoolId:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.UserPoolId
+  Region:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.Region
+  MigrationFactoryURL:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.MigrationFactoryURL
+  FactoryUserName:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.FactoryUserName
+  FactoryPassword:
+    Condition: DeployMFMGN
+    Value: !GetAtt
+      - FACTORYMGN
+      - Outputs.FactoryPassword

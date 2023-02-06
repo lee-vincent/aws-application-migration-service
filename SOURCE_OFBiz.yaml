@@ -1,0 +1,465 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation Sample Template OFBiz: OFBiz is Java ERP. This installation
+  uses a remote Postgres server . It demonstrates using the AWS CloudFormation
+  bootstrap scripts to deploy OFBiz. **WARNING** This template creates an Amazon
+  EC2 instance. You will be billed for the AWS resources used if you create a
+  stack from this template.
+
+#parameters
+Parameters:
+  DomainName:
+    Description: >-
+      The fully qualified name for the source VPC, such as onpremsim.env. The
+      name doesn't need to be publicly resolvable; it will resolve inside your
+      VPC only.
+    Type: String
+    MinLength: '5'
+    MaxLength: '16'
+    Default: onpremsim.env
+  WEBInstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  OnPremSimVPC:
+    Description: VPC to place OFBiz.
+    Type: 'AWS::EC2::VPC::Id'
+  OnPremSimSubnet1:
+    Description: Private Subnet in the source environment to place OFBiz.
+    Type: 'AWS::EC2::Subnet::Id'
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  DBPassword:
+    NoEcho: 'true'
+    Default: ofbiz
+    Description: The OFBiz database admin account password. default is ofbiz
+    Type: String
+    MinLength: '5'
+    MaxLength: '41'
+    ConstraintDescription: must contain only alphanumeric characters. default is ofbiz
+  RootPassword:
+    NoEcho: 'true'
+    Description: super user password. super user can sudo
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+
+#Mappings
+Mappings:
+  RegionMap:
+    us-east-1:
+      CentOS7x8664EBSHVM: ami-088f16c57ce74d90e
+    us-west-2:
+      CentOS7x8664EBSHVM: ami-040f9e8ab2841a9b3
+
+
+
+#Resources
+Resources:
+#SG
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref OnPremSimVPC
+      GroupDescription: >-
+        Enable HTTP access via port 80 locked down to the load balancer + SSH
+        access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref OnPremSimVPC
+      GroupDescription: >-
+        Enable mariadb access via port 3306 locked down to the load balancer +
+        SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+
+  #DBServer        
+  DBServer:
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          OFBiz_install:
+            - install_cfn
+            - register_dns
+            - setup_ssh
+            - install_OFBiz
+            - configure_OFBiz
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                    [main]
+                    stack= ${AWS::StackId}
+                    region= ${AWS::Region}
+                    verbose=true
+                    interval=5
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                    [cfn-auto-reloader-hook]
+                    triggers=post.update
+                    path=Resources.DBServer.Metadata.AWS::CloudFormation::Init
+                    action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DBServer --configsets OFBiz_install --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        register_dns:
+          files:
+            /tmp/nsupdate.sh:
+              content: !Sub | 
+                    #!/bin/sh
+                    ADDR=`hostname -I`
+                    HOST=`hostname`
+                    REVERSE=`echo $ADDR | awk -F. '{ print $4, $3, $2, $1 }' OFS='.'`
+                    echo "server dns.${DomainName}" > /tmp/nsupdate.txt
+                    echo "update delete $HOST A" >> /tmp/nsupdate.txt
+                    echo "update add $HOST 86400 A $ADDR" >> /tmp/nsupdate.txt
+                    echo "" >> /tmp/nsupdate.txt
+                    echo "update add $REVERSE.in-addr.arpa. 86400 PTR $HOST." >> /tmp/nsupdate.txt
+                    echo "send" >> /tmp/nsupdate.txt
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            register_dns:
+              command: /tmp/nsupdate.sh ; nsupdate /tmp/nsupdate.txt
+        setup_ssh:
+          files:
+            /tmp/adduser.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    adduser user -g wheel
+                    echo ${RootPassword} | passwd user --stdin
+              mode: '000500'
+              owner: root
+              group: root
+            /tmp/fixssh.sh:
+              content: !Sub |  
+                    #!/bin/sh
+                    sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+                    systemctl restart sshd
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_create_user:
+              command: /tmp/adduser.sh
+            02_fix_ssh:
+              command: /tmp/fixssh.sh
+            03_fix_sudo:
+              command: !Sub |
+                echo '%wheel        ALL=(ALL)       NOPASSWD: ALL' >>/etc/sudoers
+        install_OFBiz:
+          packages:
+            yum:
+              postgresql-server: []
+          commands:
+            01_init_postgres:
+              command: /usr/bin/postgresql-setup initdb
+            02_setup_postgres:
+              command: sed -i 's/#listen_addresses/listen_addresses/g' /var/lib/pgsql/data/postgresql.conf
+            03_setup_postgres:
+              command: sed -i 's/localhost/*/g' /var/lib/pgsql/data/postgresql.conf
+            04_postgres_remote:
+              command: 
+                echo 'host all ofbiz all password' >> /var/lib/pgsql/data/pg_hba.conf
+          services:
+            sysvinit:
+              postgresql:
+                enabled: 'true'
+                ensureRunning: 'true'
+        configure_OFBiz:
+          files:
+            /tmp/setup_postgres.sh:
+              content: !Sub |
+                 sudo -u postgres psql -c "CREATE USER ofbiz WITH ENCRYPTED PASSWORD '${DBPassword}';"
+                 sudo -u postgres psql -c "CREATE DATABASE ofbiz;"
+                 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ofbiz TO ofbiz;"
+                 sudo -u postgres psql -c "CREATE DATABASE ofbizolap;"
+                 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ofbizolap TO ofbiz;"
+                 sudo -u postgres psql -c "CREATE DATABASE ofbiztenant;"
+                 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ofbiztenant TO ofbiz;"
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_configure_OFBiz:
+              command: /tmp/setup_postgres.sh
+    Properties:
+      ImageId: !FindInMap 
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - CentOS7x8664EBSHVM
+      InstanceType: !Ref WEBInstanceType
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-OFBiz-DB
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref OnPremSimSubnet1
+          GroupSet:
+            - !Ref DatabaseSecurityGroup
+      UserData: 
+        Fn::Base64:
+         !Sub | 
+            #!/bin/bash -xe
+            hostnamectl set-hostname ofbiz-db.${DomainName}
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DBServer --configsets OFBiz_install --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource DBServer --region ${AWS::Region}
+            sleep 30
+            yum remove cloud-init -y
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+
+  #WebServer
+  WebServer:
+    DependsOn: DBServer
+    Type: 'AWS::EC2::Instance'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          OFBiz_install:
+            - install_cfn
+            - register_dns
+            - setup_ssh
+            - install_OFBiz
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                    [main]
+                    stack= ${AWS::StackId}
+                    region= ${AWS::Region}
+                    verbose=true
+                    interval=5
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                    [cfn-auto-reloader-hook]
+                    triggers=post.update
+                    path=Resources.WebServer.Metadata.AWS::CloudFormation::Init
+                    action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --configsets OFBiz_install --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        register_dns:
+          files:
+            /tmp/nsupdate.sh:
+              content: !Sub | 
+                    #!/bin/sh
+                    ADDR=`hostname -I`
+                    HOST=`hostname`
+                    REVERSE=`echo $ADDR | awk -F. '{ print $4, $3, $2, $1 }' OFS='.'`
+                    echo "server dns.${DomainName}" > /tmp/nsupdate.txt
+                    echo "update delete $HOST A" >> /tmp/nsupdate.txt
+                    echo "update add $HOST 86400 A $ADDR" >> /tmp/nsupdate.txt
+                    echo "" >> /tmp/nsupdate.txt
+                    echo "update add $REVERSE.in-addr.arpa. 86400 PTR $HOST." >> /tmp/nsupdate.txt
+                    echo "send" >> /tmp/nsupdate.txt
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            register_dns:
+              command: /tmp/nsupdate.sh ; nsupdate /tmp/nsupdate.txt
+        setup_ssh:
+          files:
+            /tmp/adduser.sh:
+              content: !Sub |
+                    #!/bin/sh
+                    adduser user -g wheel
+                    echo ${RootPassword} | passwd user --stdin
+              mode: '000500'
+              owner: root
+              group: root
+            /tmp/fixssh.sh:
+              content: !Sub |  
+                    #!/bin/sh
+                    sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+                    systemctl restart sshd
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_create_user:
+              command: /tmp/adduser.sh
+            02_fix_ssh:
+              command: /tmp/fixssh.sh
+            03_fix_sudo:
+              command: !Sub |
+                echo '%wheel        ALL=(ALL)       NOPASSWD: ALL' >>/etc/sudoers
+        install_OFBiz:
+          packages:
+            yum:
+              java-1.8.0-openjdk-devel: []
+              java-1.8.0-openjdk: []
+              perl-Digest-SHA: []
+          sources:
+            /opt: 'https://archive.apache.org/dist/ofbiz/apache-ofbiz-18.12.05.zip'
+          files:
+            /tmp/update_ofbiz_config.sh:
+              content: !Sub | 
+                  #!/bin/bash -xe
+                  ofbizconfig=/opt/apache-ofbiz-18.12.05/framework/entity/config/entityengine.xml
+                  sed -i 's/datasource-name="localderbyolap"/datasource-name="localpostgresolap"/g' $ofbizconfig
+                  sed -i 's/datasource-name="localderbytenant"/datasource-name="localpostgrestenant"/g' $ofbizconfig
+                  sed -i 's/datasource-name="localderby"/datasource-name="localpostgres"/g' $ofbizconfig
+                  sed -i 's/jdbc-password="ofbiz"/jdbc-password="${DBPassword}"/g' $ofbizconfig
+                  sed -i 's/127.0.0.1/ofbiz-db.${DomainName}/g' $ofbizconfig
+                  ofbizsecurity=/opt/apache-ofbiz-18.12.05/framework/security/config/security.properties
+                  sed -i 's/host-headers-allowed=/host-headers-allowed=ofbiz-web,ofbiz-web.onpremsim.env,onpremsim.env/g' $ofbizsecurity
+              mode: '000500'
+              owner: root
+              group: root
+            /lib/systemd/system/ofbiz.service:
+              content: !Sub |
+                   [Unit]
+                   Description=OFBiz Service Daemon
+                   After=network.target auditd.service
+                   [Service]
+                   WorkingDirectory=/opt/apache-ofbiz-18.12.05
+                   ExecStart=/opt/apache-ofbiz-18.12.05/gradlew loadAll ofbiz -x test
+                   ExecStop=/opt/apache-ofbiz-18.12.05/gradlew 'ofbiz --shutdown'
+                   RemainAfterExit=yes
+                   Type=simple
+                   Restart=always
+                   RestartSec=60
+                   StartLimitInterval=300
+                   StartLimitBurst=15
+                   [Install]
+                   WantedBy=multi-user.target
+              mode: '000444'
+              owner: root
+              group: root
+          commands:
+            01_update_ofbiz_config:
+              command: /tmp/update_ofbiz_config.sh
+            02_init_wrapper:
+              command: gradle/init-gradle-wrapper.sh
+              cwd: /opt/apache-ofbiz-18.12.05
+            03_load_pg_plugin:
+              command: n=0; until [ $n -ge 3 ]; do ./gradlew createPlugin -PpluginId=PostgressDemo  && break; n=$[$n+1]; sleep 5; done
+              cwd: /opt/apache-ofbiz-18.12.05
+            04_add_pg_plugin:
+              command: sed -i "22i   pluginLibsRuntime 'org.postgresql:postgresql:42.2.1'" /opt/apache-ofbiz-18.12.05/plugins/PostgressDemo/build.gradle
+          services:
+            sysvinit:
+              ofbiz:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !FindInMap 
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - CentOS7x8664EBSHVM
+      InstanceType: t3.medium
+      Tags:
+        - Key: Environment
+          Value: Source
+        - Key: Name
+          Value: MID-OFBiz-WEB
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref OnPremSimSubnet1
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+      UserData: 
+        Fn::Base64:
+         !Sub | 
+              #!/bin/bash -xe
+              hostnamectl set-hostname ofbiz-web.${DomainName}
+              fallocate -l 1G /swapfile
+              dd if=/dev/zero of=/swapfile bs=1024 count=1048576
+              chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+              echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --configsets OFBiz_install --region ${AWS::Region}
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+              sleep 30
+              yum remove cloud-init -y
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+
+#Outputs
+Outputs:
+  WebsiteURL:
+    Value: !Sub https://OFBiz-web.${DomainName}:8443/accounting
+    Description: OFBiz Website
